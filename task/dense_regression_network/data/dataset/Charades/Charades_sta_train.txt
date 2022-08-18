@@ -1,0 +1,10 @@
+AO8RW 0.0 6.9##a person is putting a book on a shelf.
+Y6R7T 20.8 30.0##person begins to play on a phone.
+Y6R7T 20.8 30.0##person start playing on their phone.
+Y6R7T 7.3 17.3##person pouring it into a glass.
+Y6R7T 7.3 17.3##the person pours some water into the glass.
+Y6R7T 7.3 17.3##person pours water into a glass.
+IGDIE 22.7 34.0##person starts watching television.
+7UPGT 13.9 19.7##person takes a cup out the fridge.
+KBPDM 7.1 13.6##person sneezing on a mirror.
+KBPDM 0.0 11.1##a person is awakening.
