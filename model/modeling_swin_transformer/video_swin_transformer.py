@@ -666,6 +666,12 @@ class SwinTransformer3D(nn.Module):
         x = self.norm(x)
         x = rearrange(x, 'n d h w c -> n c d h w')
 
+        # N：批处理大小
+        # C：channel，通道数
+        # D：深度，表示图像Z维度的特征图数目
+        # H：高度
+        # W：宽度
+
         return x
 
     def train(self, mode=True):

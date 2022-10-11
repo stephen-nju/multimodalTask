@@ -14,7 +14,7 @@ model = init_recognizer(config_file, checkpoint_file, device=device)
 
 # 测试单个视频并显示其结果
 # video = './task/c3d/v_PlayingGuitar_g03_c05'
-video='./task/c3d/v_PlayingGuitar_g03_c05.avi'
+video = './task/c3d/v_PlayingGuitar_g03_c05.avi'
 results, returned_features = inference_recognizer(model, video, outputs="backbone")
 
 print(results)

@@ -9,26 +9,25 @@
 """
 
 import argparse
-import itertools
 import logging
-import random
 import os
+import random
+from abc import ABCMeta
 from functools import partial
 from multiprocessing import cpu_count, Pool
-from typing import Optional
-from sklearn.preprocessing import LabelEncoder
-
+from typing import Optional, Tuple, List, Type, Callable, Any
 import numpy as np
-import torchmetrics
-from tqdm import tqdm
-from transformers import BertTokenizer
-from transformers.models.bert.modeling_bert import BertPreTrainedModel, BertConfig
-from model.modeling_cmt.cross_modal_transformer import CrossTransformerModel
-from model.modeling_swin_transformer.video_swin_transformer import SwinTransformer3D
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
+import torchmetrics
+import torch.nn as nn
+from torch.utils.data import default_convert, default_collate
 from pytorch_lightning.callbacks import LearningRateMonitor
+from pytorch_lightning.utilities.types import TRAIN_DATALOADERS
+from pytorchvideo.data import ClipSampler, make_clip_sampler
+from pytorchvideo.data.utils import MultiProcessSampler
+from pytorchvideo.data.video import VideoPathHandler
 from pytorchvideo.transforms import (
     ApplyTransformToKey,
     Normalize,
@@ -37,13 +36,23 @@ from pytorchvideo.transforms import (
     ShortSideScale,
     UniformTemporalSubsample,
 )
+from sklearn.preprocessing import LabelEncoder
+from torch.utils.data.dataset import IterableDataset
 from torchvision.transforms import (
     CenterCrop,
     Compose,
-    Lambda,
     RandomCrop,
-    RandomHorizontalFlip,
+    RandomHorizontalFlip, ToTensor,
 )
+from tqdm import tqdm
+from transformers import BertTokenizer, PreTrainedTokenizer
+from transformers.models.bert.modeling_bert import BertPreTrainedModel, BertConfig, BertModel
+
+from core.snipets import sequence_padding
+from model.modeling_cmt.cross_modal_transformer import CrossTransformerModel
+from model.modeling_swin_transformer.video_swin_transformer import SwinTransformer3D
+
+logger = logging.getLogger("pytorchvideo")
 
 
 class InputExample(object):
@@ -80,6 +89,224 @@ class InputFeature(object):
         self.label_id = label_id
 
 
+class MultimodalDataset(IterableDataset, metaclass=ABCMeta):
+    _MAX_CONSECUTIVE_FAILURES = 10
+
+    def __init__(
+            self,
+            input_features: List[Tuple[str, Optional[dict]]],
+            clip_sampler: ClipSampler,
+            video_sampler: Type[torch.utils.data.Sampler] = torch.utils.data.RandomSampler,
+            transform: Optional[Callable[[dict], Any]] = None,
+            decode_audio: bool = False,
+            decoder: str = "pyav",
+    ) -> None:
+        """
+        Args:
+            input_features (List[Tuple[str, Optional[dict]]]): List containing multimodal input feature
+
+            clip_sampler (ClipSampler): Defines how clips should be sampled from each
+                video. See the clip sampling documentation for more information.
+
+            video_sampler (Type[torch.utils.data.Sampler]): Sampler for the internal
+                video container. This defines the order videos are decoded and,
+                if necessary, the distributed split.
+
+            transform (Callable): This callable is evaluated on the clip output before
+                the clip is returned. It can be used for user defined preprocessing and
+                augmentations on the clips. The clip output format is described in __next__().
+
+            decode_audio (bool): If True, also decode audio from video.
+
+            decoder (str): Defines what type of decoder used to decode a video. Not used for
+                frame videos.
+        """
+
+        self._decode_audio = decode_audio
+        self._transform = transform
+        self._clip_sampler = clip_sampler
+        self._input_features = input_features
+        self._decoder = decoder
+
+        # If a RandomSampler is used we need to pass in a custom random generator that
+        # ensures all PyTorch multiprocess workers have the same random seed.
+        self._video_random_generator = None
+        if video_sampler == torch.utils.data.RandomSampler:
+            self._video_random_generator = torch.Generator()
+            self._video_sampler = video_sampler(
+                self._input_features, generator=self._video_random_generator
+            )
+        else:
+            self._video_sampler = video_sampler(self._input_features)
+
+        self._video_sampler_iter = None  # Initialized on first call to self.__next__()
+
+        # Depending on the clip sampler type, we may want to sample multiple clips
+        # from one video. In that case, we keep the store video, label and previous sampled
+        # clip time in these variables.
+        self._loaded_video_label = None
+        self._loaded_clip = None
+        self._next_clip_start_time = 0.0
+        self.video_path_handler = VideoPathHandler()
+
+    @property
+    def video_sampler(self):
+        """
+        Returns:
+            The video sampler that defines video sample order. Note that you'll need to
+            use this property to set the epoch for a torch.utils.data.DistributedSampler.
+        """
+        return self._video_sampler
+
+    @property
+    def num_videos(self):
+        """
+        Returns:
+            Number of videos in dataset.
+        """
+        return len(self.video_sampler)
+
+    def __next__(self) -> dict:
+        """
+        Retrieves the next clip based on the clip sampling strategy and video sampler.
+
+        Returns:
+            A dictionary with the following format.
+
+            .. code-block:: text
+
+                {
+                    'video': <video_tensor>,
+                    'label': <index_label>,
+                    'video_label': <index_label>
+                    'video_index': <video_index>,
+                    'clip_index': <clip_index>,
+                    'aug_index': <aug_index>,
+                }
+        """
+        if not self._video_sampler_iter:
+            # Setup MultiProcessSampler here - after PyTorch DataLoader workers are spawned.
+            self._video_sampler_iter = iter(MultiProcessSampler(self._video_sampler))
+
+        for i_try in range(self._MAX_CONSECUTIVE_FAILURES):
+            # Reuse previously stored video if there are still clips to be sampled from
+            # the last loaded video.
+            if self._loaded_video_label:
+                video, info_dict, video_index = self._loaded_video_label
+            else:
+                video_index = next(self._video_sampler_iter)
+                try:
+                    input_feature = self._input_features[video_index]
+                    info_dict = input_feature.__dict__
+                    video = self.video_path_handler.video_from_path(
+                        filepath=input_feature.video_name,
+                        decode_audio=self._decode_audio,
+                        decoder=self._decoder,
+                    )
+                    self._loaded_video_label = (video, info_dict, video_index)
+                except Exception as e:
+                    logger.debug(
+                        "Failed to load video with error: {}; trial {}".format(
+                            e,
+                            i_try,
+                        )
+                    )
+                    continue
+
+            (
+                clip_start,
+                clip_end,
+                clip_index,
+                aug_index,
+                is_last_clip,
+            ) = self._clip_sampler(
+                self._next_clip_start_time, video.duration, info_dict
+            )
+
+            if isinstance(clip_start, list):  # multi-clip in each sample
+
+                # Only load the clips once and reuse previously stored clips if there are multiple
+                # views for augmentations to perform on the same clips.
+                if aug_index[0] == 0:
+                    self._loaded_clip = {}
+                    loaded_clip_list = []
+                    for i in range(len(clip_start)):
+                        clip_dict = video.get_clip(clip_start[i], clip_end[i])
+                        if clip_dict is None or clip_dict["video"] is None:
+                            self._loaded_clip = None
+                            break
+                        loaded_clip_list.append(clip_dict)
+
+                    if self._loaded_clip is not None:
+                        for key in loaded_clip_list[0].keys():
+                            self._loaded_clip[key] = [x[key] for x in loaded_clip_list]
+
+            else:  # single clip case
+
+                # Only load the clip once and reuse previously stored clip if there are multiple
+                # views for augmentations to perform on the same clip.
+                if aug_index == 0:
+                    self._loaded_clip = video.get_clip(clip_start, clip_end)
+
+            self._next_clip_start_time = clip_end
+
+            video_is_null = (
+                    self._loaded_clip is None or self._loaded_clip["video"] is None
+            )
+            if (
+                    is_last_clip[-1] if isinstance(is_last_clip, list) else is_last_clip
+            ) or video_is_null:
+                # Close the loaded encoded video and reset the last sampled clip time ready
+                # to sample a new video on the next iteration.
+                self._loaded_video_label[0].close()
+                self._loaded_video_label = None
+                self._next_clip_start_time = 0.0
+                self._clip_sampler.reset()
+                if video_is_null:
+                    logger.debug(
+                        "Failed to load clip {}; trial {}".format(video.name, i_try)
+                    )
+                    continue
+
+            frames = self._loaded_clip["video"]
+            audio_samples = self._loaded_clip["audio"]
+            sample_dict = {
+                "video": frames,
+                "video_name": video.name,
+                "video_index": video_index,
+                "clip_index": clip_index,
+                "aug_index": aug_index,
+                **info_dict,
+                **({"audio": audio_samples} if audio_samples is not None else {}),
+            }
+            if self._transform is not None:
+                sample_dict = self._transform(sample_dict)
+
+                # User can force dataset to continue by returning None in transform.
+                if sample_dict is None:
+                    continue
+
+            return sample_dict
+        else:
+            raise RuntimeError(
+                f"Failed to load video after {self._MAX_CONSECUTIVE_FAILURES} retries."
+            )
+
+    def __iter__(self):
+        self._video_sampler_iter = None  # Reset video sampler
+
+        # If we're in a PyTorch DataLoader multiprocessing context, we need to use the
+        # same seed for each worker's RandomSampler generator. The workers at each
+        # __iter__ call are created from the unique value: worker_info.seed - worker_info.id,
+        # which we can use for this seed.
+        worker_info = torch.utils.data.get_worker_info()
+        if self._video_random_generator is not None and worker_info is not None:
+            base_seed = worker_info.seed - worker_info.id
+            self._video_random_generator.manual_seed(base_seed)
+
+        return self
+
+
 class MultimodalDataModule(pl.LightningDataModule):
     """
     This LightningDataModule implementation constructs a PyTorchVideo Kinetics dataset for both
@@ -87,64 +314,85 @@ class MultimodalDataModule(pl.LightningDataModule):
     preprocessing transforms and configures the PyTorch DataLoaders.
     """
 
-    def __init__(self, args, tokenizer, label_encode=None):
+    def __init__(self, args, tokenizer: Optional[PreTrainedTokenizer], label_encode):
         self.args = args
-        self.label_encode: LabelEncoder = label_encode
         self.tokenizer = tokenizer
+        self.label_encode = label_encode
         super().__init__()
 
-    def prepare_data(self) -> None:
+    def setup(self, stage: Optional[str] = None) -> None:
         """
-        读取视频标注文件，包含训练集文件和测试集文件
+          读取视频标注文件，包含训练集文件和测试集文件
         """
+        train_example = self._load_raw_data(test=False)
+        train_feature = self.convert_examples_to_features(train_example,
+                                                          self.args.max_length,
+                                                          mode="train")
+        self.train_dataset = MultimodalDataset(input_features=train_feature,
+                                               clip_sampler=make_clip_sampler("random",
+                                                                              self.args.clip_duration),
+                                               transform=self._make_transforms(mode="train"),
+                                               video_sampler=torch.utils.data.sampler.RandomSampler
+                                               )
+
+    def train_dataloader(self) -> TRAIN_DATALOADERS:
+
+        return torch.utils.data.DataLoader(dataset=self.train_dataset,
+                                           batch_size=self.args.batch_size,
+                                           collate_fn=self._collate_fn)
+
+    def _load_raw_data(self, test=False):
+        train_example = []
         with open(self.args.train_data, "r", encoding="utf-8") as g:
-            for line in g:
+            for index, line in enumerate(g):
                 ss = line.strip().split()
+                train_example.append(InputExample(guid=f"train-{index}",
+                                                  text="train",
+                                                  video_name=os.path.join(self.args.video_path_prefix, ss[0]),
+                                                  label=[ss[1]]
+                                                  ))
+        if test:
+            test_example = []
+            with open(self.args.test_data, "r", encoding="utf-8") as g:
+                for index, line in enumerate(g):
+                    ss = line.strip().split("\t")
+                    test_example.append(InputExample(guid=f"train-{index}",
+                                                     text="train",
+                                                     video_name=os.path.join(self.args.video_path_prefix, ss[0]),
+                                                     label=[ss[1]]
+                                                     ))
+            return train_example, test_example
+        return train_example
+
+    def _collate_fn(self, data):
+        batch_token_ids, batch_segment_ids, batch_input_mask, batch_labels, guids, videos = [], [], [], [], [], []
+        for feature in data:
+            guids.append(feature["guid"])
+            videos.append(feature["video"])
+            batch_token_ids.append(feature["text_input_ids"])
+            batch_input_mask.append(feature["text_input_mask"])
+            batch_segment_ids.append(feature["text_segment_ids"])
+            batch_labels.append(feature["label_id"])
+
+        batch_token_ids = sequence_padding(batch_token_ids, value=self.tokenizer.pad_token_id)
+        batch_segment_ids = sequence_padding(batch_segment_ids)
+        # 先转化为array再转为tensor
+        return {
+            "videos": torch.stack(default_convert(videos), dim=0),
+            "token_input_ids": torch.tensor(batch_token_ids),
+            "token_type_ids": torch.tensor(batch_segment_ids),
+            "token_attention_mask": torch.tensor(np.array(batch_input_mask)),
+            "labels": torch.tensor(np.array(batch_labels), dtype=torch.long)
+        }
 
     def _make_transforms(self, mode: str):
-        """
-        ##################
-        # PTV Transforms #
-        ##################
-        # Each PyTorchVideo dataset has a "transform" arg. This arg takes a
-        # Callable[[Dict], Any], and is used on the output Dict of the dataset to
-        # define any application specific processing or augmentation. Transforms can
-        # either be implemented by the user application or reused from any library
-        # that's domain specific to the modality. E.g. for video we recommend using
-        # TorchVision, for audio we recommend TorchAudio.
-        #
-        # To improve interoperation between domain transform libraries, PyTorchVideo
-        # provides a dictionary transform API that provides:
-        #   - ApplyTransformToKey(key, transform) - applies a transform to specific modality
-        #   - RemoveKey(key) - remove a specific modality from the clip
-        #
-        # In the case that the recommended libraries don't provide transforms that
-        # are common enough for PyTorchVideo use cases, PyTorchVideo will provide them in
-        # the same structure as the recommended library. E.g. TorchVision didn't
-        # have a RandomShortSideScale video transform so it's been added to PyTorchVideo.
-        """
-
-        if self.args.data_type == "video":
-            transform = [
-                self._video_transform(mode),
-                RemoveKey("audio"),
-            ]
-        elif self.args.data_type == "audio":
-            transform = [
-                self._audio_transform(),
-                RemoveKey("video"),
-            ]
-        else:
-            raise Exception(f"{self.args.data_type} not supported")
-
+        transform = [
+            self._video_transform(mode),
+            RemoveKey("audio"),
+        ]
         return Compose(transform)
 
     def _video_transform(self, mode: str):
-        """
-        This function contains example transforms using both PyTorchVideo and TorchVision
-        in the same Callable. For 'train' mode, we use augmentations (prepended with
-        'Random'), for 'val' mode we use the respective determinstic function.
-        """
         args = self.args
         return ApplyTransformToKey(
             key="video",
@@ -200,7 +448,7 @@ class MultimodalDataModule(pl.LightningDataModule):
             )
         return feature
 
-    def convert_examples_to_features(self, examples, tokenizer, label_encode, max_length, threads=4):
+    def convert_examples_to_features(self, examples, max_length, threads=4, mode="train"):
         """
         多进程的文本处理
         """
@@ -208,9 +456,8 @@ class MultimodalDataModule(pl.LightningDataModule):
         with Pool(threads) as p:
             annotate_ = partial(
                 self.convert_single_example,
-                tokenizer=tokenizer,
-                label_encode=label_encode,
-                max_length=max_length
+                max_length=max_length,
+                mode=mode
             )
             features = list(
                 tqdm(
@@ -223,66 +470,92 @@ class MultimodalDataModule(pl.LightningDataModule):
 
 
 class VideoClassificationLightningModule(pl.LightningModule):
-    def __init__(self, args):
+    def __init__(self, args: argparse.Namespace):
         self.args = args
         super().__init__()
-        self.bert_config = BertConfig.from_pretrained(args.bert_config)
+        self.bert_config = BertConfig.from_pretrained(args.bert_model)
         # 更新bert config
+        # TODO
         self.train_accuracy = torchmetrics.Accuracy()
         self.val_accuracy = torchmetrics.Accuracy()
         # 加载video模型并初始化
         self.video_swin = SwinTransformer3D()
         # 加载文本模型并初始化
-        self.bert = BertPreTrainedModel.from_pretrained(args.bert_model,
-                                                        config=self.bert_config
-                                                        )
+        self.bert = BertModel.from_pretrained(args.bert_model,
+                                              config=self.bert_config
+                                              )
         self.co_transformer = CrossTransformerModel(args.max_position_embeddings,
                                                     args.hidden_dropout_prob,
                                                     args.hidden_size,
                                                     args.num_hidden_layers,
                                                     args.num_attention_heads)
+        # 视频特征处理模块
+        if self.args.dropout_ratio != 0:
+            self.dropout = nn.Dropout(p=self.args.dropout_ratio)
+        else:
+            self.dropout = None
+        if self.args.spatial_type == 'avg':
+            # use `nn.AdaptiveAvgPool3d` to adaptively match the in_channels.
+            self.avg_pool = nn.AdaptiveAvgPool3d((1, 7, 7))
+        else:
+            self.avg_pool = None
+        self.linear = nn.Linear(in_features=args.hidden_size, out_features=2)
 
     @staticmethod
     def add_model_special_args(parent_parser: argparse.ArgumentParser):
         parser = parent_parser.add_argument_group("VideoClassificationModule")
+        parser.add_argument("--dropout_ratio", type=float, help="swin transformer head drop out ratio")
+        parser.add_argument("--spatial_type", type=str, default="avg", help=" Pooling type in spatial dimension")
         parser.add_argument("--max_position_embeddings", type=int, help="cross model ")
         parser.add_argument("--hidden_dropout_prob", type=float, default=0.1, help="cross model")
-        parser.add_argument("--hidden_size", type=int, default=256, help="")
-        parser.add_argument("--num_hidden_layers", type=int, default=3, help="")
-        parser.add_argument("--num_attention_heads", type=int, default=6, help="")
+        parser.add_argument("--hidden_size", type=int, default=768, help="")
+        parser.add_argument("--num_hidden_layers", type=int, default=12, help="")
+        parser.add_argument("--num_attention_heads", type=int, default=12, help="")
         return parent_parser
 
-    def forward(self, x, attention_mask, image_mask):  # 定义该模块的forward方法，可以方便推理和预测的接口
-        video_feature = self.video_swin(x)
-        text_feature = self.bert(x)
-        output_feature = torch.concat((video_feature, text_feature), dim=1)
-
-        concat_mask = torch.cat((attention_mask, image_mask), dim=1)
-        text_type_ = torch.zeros_like(attention_mask)
-        image_type_ = torch.ones_like(image_mask)
-        concat_type = torch.cat((text_type_, image_type_), dim=1)
-        # 构建concat type
-        cross_output, pooled_output = self.co_transformer(output_feature, concat_type, concat_mask)
+    def forward(self,
+                video_inputs,
+                text_inputs_ids,
+                text_attention_mask,
+                text_token_type_ids):  # 定义该模块的forward方法，可以方便推理和预测的接口
+        video_feature = self.video_swin(video_inputs)
+        # [N, in_channels, 4, 7, 7]
+        if self.avg_pool is not None:
+            video_feature = self.avg_pool(video_feature)
+        # [N, in_channels, 1, 7, 7]
+        if self.dropout is not None:
+            video_feature = self.dropout(video_feature)
+        # [N, in_channels, 49]
+        video_feature = video_feature.view(video_feature.shape[0], -1, 7 * 7)
+        video_feature = torch.transpose(video_feature, 1, 2)
+        # 视频特征处理
+        # video_feature shape=[N , 49, D=768 ]
+        text_feature = self.bert(text_inputs_ids, text_attention_mask, text_token_type_ids).last_hidden_state
+        # text_feature shape= [N,sequence length ,768]
+        output_feature = torch.concat((text_feature, video_feature), dim=1)
+        # 构建image序列mask
+        # image_attention_mask = torch.ones(video_feature.size(0), video_feature.size(1)).type_as(text_inputs_ids)
+        #
+        # concat_mask = torch.cat((text_attention_mask, image_attention_mask), dim=1)
+        # text_type_ = torch.zeros_like(text_attention_mask)
+        # image_type_ = torch.ones_like(image_attention_mask)
+        # concat_type = torch.cat((text_type_, image_type_), dim=1)
+        # # 构建concat type
+        cross_output, pooled_output = self.co_transformer(output_feature)
         return cross_output, pooled_output
 
     def training_step(self, batch, batch_idx):
-        """
-        batch key and value
-           {
-               'video': <video_tensor>,
-               'token index': <audio_tensor>,
-               'attention_mask'
-               'label': <action_label>,
-           }
-        """
-        x = batch['video']
-        y_hat = self.video_swin(x)
-        loss = F.cross_entropy(y_hat, batch["label"])
-        acc = self.train_accuracy(F.softmax(y_hat, dim=-1), batch["label"])
-        self.log("train_loss", loss)
-        self.log(
-            "train_acc", acc, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True
-        )
+        _, y = self.forward(video_inputs=batch["videos"],
+                            text_inputs_ids=batch["token_input_ids"],
+                            text_attention_mask=batch["token_attention_mask"],
+                            text_token_type_ids=batch["token_type_ids"])
+        y_hat = self.linear(y)
+        loss = F.cross_entropy(y_hat, batch["labels"].squeeze())
+        # acc = self.train_accuracy(F.softmax(y_hat, dim=-1), batch["label_ids"])
+        # self.log("train_loss", loss)
+        # self.log(
+        #     "train_acc", acc, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True
+        # )
         return loss
 
     def configure_optimizers(self):
@@ -299,19 +572,23 @@ class VideoClassificationLightningModule(pl.LightningModule):
         return [optimizer], [scheduler]
 
 
+def setup_seed(seed):
+    pl.seed_everything(seed)
+    random.seed(seed)  # 为python设置随机种子
+    np.random.seed(seed)  # 为numpy设置随机种子
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+
 def main():
     """
-    To train the ResNet with the Kinetics dataset we construct the two modules above,
-    and pass them to the fit function of a pl.Trainer.
-    This example can be run either locally (with default parameters) or on a Slurm
-    cluster. To run on a Slurm cluster provide the --on_cluster argument.
+    main function
     """
-    setup_logger()
-    setup_seed(42)
 
-    pl.trainer.seed_everything()
+    setup_seed(42)
     parser = argparse.ArgumentParser()
     # Model parameters.
+    parser.add_argument("--bert_model", type=str, required=True, default=None)
     parser.add_argument("--lr", "--learning-rate", default=0.1, type=float)
     parser.add_argument("--momentum", default=0.9, type=float)
     parser.add_argument("--weight_decay", default=1e-4, type=float)
@@ -323,14 +600,14 @@ def main():
     )
 
     # Data parameters.
-    parser.add_argument("--data_path", default=None, type=str, required=True)
-    parser.add_argument("--video_path_prefix", default="", type=str)
+    parser.add_argument("--train_data", default=None, type=str)
+    parser.add_argument("--test_data", default=None, type=str)
+
+    parser.add_argument("--max_length", default=128, type=int)
+    parser.add_argument("--video_path_prefix", default="F:\\Video\\demo", type=str)
     parser.add_argument("--workers", default=1, type=int)
-    parser.add_argument("--batch_size", default=1, type=int)
+    parser.add_argument("--batch_size", default=2, type=int)
     parser.add_argument("--clip_duration", default=2, type=float)
-    parser.add_argument(
-        "--data_type", default="video", choices=["video", "audio"], type=str
-    )
     parser.add_argument("--video_num_subsampled", default=8, type=int)
     parser.add_argument("--video_means", default=(0.45, 0.45, 0.45), type=tuple)
     parser.add_argument("--video_stds", default=(0.225, 0.225, 0.225), type=tuple)
@@ -349,35 +626,18 @@ def main():
         max_epochs=200,
         callbacks=[LearningRateMonitor()],
         replace_sampler_ddp=False,
-        max_position_embeddings=512
+        max_position_embeddings=512,
+        dropout_ratio=0.5
     )
     args = parser.parse_args()
-    train(args)
+    tokenizer = BertTokenizer.from_pretrained(args.bert_model)
+    label_encode = LabelEncoder()
+    label_encode.fit(['0', '1'])
 
-
-def train(args):
     trainer = pl.Trainer.from_argparse_args(args)
     classification_module = VideoClassificationLightningModule(args)
-    data_module = MultimodalDataModule(args)
+    data_module = MultimodalDataModule(args=args, tokenizer=tokenizer, label_encode=label_encode)
     trainer.fit(classification_module, data_module)
-
-
-def setup_logger():
-    ch = logging.StreamHandler()
-    formatter = logging.Formatter("\n%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    ch.setFormatter(formatter)
-    logger = logging.getLogger("pytorchvideo")
-    logger.setLevel(logging.DEBUG)
-    logger.addHandler(ch)
-
-
-def setup_seed(seed):
-    random.seed(seed)  # 为python设置随机种子
-    np.random.seed(seed)  # 为numpy设置随机种子
-    torch.random.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    os.environ['TF_DETERMINISTIC_OPS'] = '1'
-    # tf gpu fix seed, please `pip install tensorflow-determinism` first
 
 
 if __name__ == "__main__":

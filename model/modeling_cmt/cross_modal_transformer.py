@@ -142,7 +142,7 @@ class CrossTransformerModel(nn.Module):
         transformer_heads = num_attention_heads
         self.transformer = Transformer(width=transformer_width, layers=transformer_layers, heads=transformer_heads, )
         self.pooler = CrossPooler(hidden_size)
-        self.apply(self.init_weights)
+        # self.apply(self.init_weights)
 
     def initialize_parameters(self):
         proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
@@ -160,6 +160,23 @@ class CrossTransformerModel(nn.Module):
         extended_attention_mask = (1.0 - extended_attention_mask) * -1000000.0
         extended_attention_mask = extended_attention_mask.expand(-1, attention_mask.size(1), -1)
         return extended_attention_mask
+
+    @property
+    def dtype(self):
+        """
+        :obj:`torch.dtype`: The dtype of the module (assuming that all the module parameters have the same dtype).
+        """
+        try:
+            return next(self.parameters()).dtype
+        except StopIteration:
+            # For nn.DataParallel compatibility in PyTorch 1.5
+            def find_tensor_attributes(module: nn.Module):
+                tuples = [(k, v) for k, v in module.__dict__.items() if torch.is_tensor(v)]
+                return tuples
+
+            gen = self._named_members(get_members_fn=find_tensor_attributes)
+            first_tuple = next(gen)
+            return first_tuple[1].dtype
 
     def forward(self, concat_input, concat_type=None, attention_mask=None):
 
