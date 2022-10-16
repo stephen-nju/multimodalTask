@@ -506,7 +506,7 @@ class VideoClassificationLightningModule(pl.LightningModule):
         # TODO
         self.acc = torchmetrics.Accuracy(num_classes=2, top_k=1)
         # 加载video模型并初始化
-        self.video_swin = SwinTransformer3D(pretrained=args.pretrained_video)
+        self.video_swin = SwinTransformer3D(pretrained=args.pretrained_video_model)
         # 加载文本模型并初始化
         self.bert = BertModel.from_pretrained(args.bert_model,
                                               config=self.bert_config
@@ -619,10 +619,11 @@ class VideoClassificationLightningModule(pl.LightningModule):
 
     def configure_optimizers(self):
         # 需要重新定义优化器和学习率
+
         optimizer = torch.optim.SGD(
             [
-                {"params": self.video_swin.parameters(), "lr": self.args.lr * 100},
-                {"params": self.bert.parameters(), "lr": self.args.lr},
+                {"params": self.video_swin.parameters(), "lr": self.args.learning_rate_video},
+                {"params": self.bert.parameters(), "lr": self.args.learning_rate_bert},
                 {"params": self.linear.parameters()},
                 {"params": self.co_transformer.parameters()}
             ],
@@ -652,17 +653,19 @@ def main():
     setup_seed(42)
     parser = argparse.ArgumentParser()
     # Model parameters.
-    parser.add_argument("--bert_model", type=str, required=True, default=None)
-    parser.add_argument("--pretrained_video", type=str, help="pretrained video model")
-    parser.add_argument("--lr", "--learning-rate", default=0.1, type=float)
+    parser.add_argument("--bert_model", type=str, help="text bert model path")
+    parser.add_argument("--learning-rate-bert", type=float, help="bert model learning rate")
+    parser.add_argument("--pretrained_video_model", type=str, help="pretrained video model")
+    parser.add_argument("--learn-rate-video", type=float, help="video swin transformer pretrained learning rate")
+    parser.add_argument("--lr", "--learning-rate", default=0.1, type=float, help="default learning rate")
     parser.add_argument("--momentum", default=0.9, type=float)
     parser.add_argument("--weight_decay", default=1e-4, type=float)
     # Data parameters.
-    parser.add_argument("--train_data", default=None, type=str)
-    parser.add_argument("--test_data", default=None, type=str)
+    parser.add_argument("--train_data", type=str)
+    parser.add_argument("--test_data", type=str)
 
     parser.add_argument("--max_length", default=128, type=int)
-    parser.add_argument("--video_path_prefix", default="F:\\Video\\demo", type=str)
+    parser.add_argument("--video_path_prefix", type=str, help="video data directory")
     parser.add_argument("--num_workers", default=4, type=int)
     parser.add_argument("--batch_size", default=2, type=int)
     parser.add_argument("--clip_duration", default=2, type=float)
@@ -680,18 +683,20 @@ def main():
     # 添加模型参数
     parser = VideoClassificationLightningModule.add_model_special_args(parser)
 
-    # 设置默认参数
+    # 设置部分默认参数
     parser.set_defaults(
         max_epochs=10,
         replace_sampler_ddp=False,
         max_position_embeddings=512,
-        dropout_ratio=0.5
+        dropout_ratio=0.5,
+        learning_rate_bert=1e-5,
+        learning_rate_video=1e-3
     )
     args = parser.parse_args()
     checkpoint_callback = ModelCheckpoint(dirpath=args.default_root_dir,
                                           monitor='train_loss',
                                           filename='multimodal_video-{epoch:02d}-{train_loss:.2f}')
-    early_stop = EarlyStopping("val_loss", mode="max", patience=3, min_delta=0.2)
+    early_stop = EarlyStopping("val_acc", mode="max", patience=5, min_delta=0.01, verbose=True)
 
     tokenizer = BertTokenizer.from_pretrained(args.bert_model)
     label_encode = LabelEncoder()
