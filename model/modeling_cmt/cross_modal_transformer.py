@@ -14,15 +14,10 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import json
-import logging
 import torch
 from torch import nn
 from collections import OrderedDict
-
 from torch.nn import LayerNorm
-
-logger = logging.getLogger(__name__)
 
 
 # TODO
@@ -180,10 +175,11 @@ class CrossTransformerModel(nn.Module):
 
     def forward(self, concat_input, concat_type=None, attention_mask=None):
 
+        # https://pytorch.org/docs/stable/generated/torch.Tensor.to.html#torch-tensor-to
         if attention_mask is None:
-            attention_mask = torch.ones(concat_input.size(0), concat_input.size(1))
+            attention_mask = torch.ones(concat_input.size(0), concat_input.size(1)).to(concat_input)
         if concat_type is None:
-            concat_type = torch.zeros_like(attention_mask)
+            concat_type = torch.zeros_like(attention_mask).to(concat_input)
 
         extended_attention_mask = self.build_attention_mask(attention_mask)
 

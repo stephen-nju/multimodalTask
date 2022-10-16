@@ -23,9 +23,7 @@ import torch
 import torch.nn.functional as F
 import torchmetrics
 import torch.nn as nn
-from torch.utils.data import default_convert, default_collate
-from pytorch_lightning.callbacks import LearningRateMonitor
-from pytorch_lightning.utilities.types import TRAIN_DATALOADERS, EVAL_DATALOADERS
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, EarlyStopping
 from pytorchvideo.data import ClipSampler, make_clip_sampler
 from pytorchvideo.data.utils import MultiProcessSampler
 from pytorchvideo.data.video import VideoPathHandler
@@ -43,17 +41,15 @@ from torchvision.transforms import (
     CenterCrop,
     Compose,
     RandomCrop,
-    RandomHorizontalFlip, ToTensor,
+    RandomHorizontalFlip
 )
 from tqdm import tqdm
 from transformers import BertTokenizer, PreTrainedTokenizer
 from transformers.models.bert.modeling_bert import BertPreTrainedModel, BertConfig, BertModel
-
-from core.snipets import sequence_padding
+from loguru import logger
+from core.snipets import sequence_padding, convert_array_to_tensor
 from model.modeling_cmt.cross_modal_transformer import CrossTransformerModel
 from model.modeling_swin_transformer.video_swin_transformer import SwinTransformer3D
-
-logger = logging.getLogger("pytorchvideo")
 
 
 class InputExample(object):
@@ -326,7 +322,8 @@ class MultimodalDataModule(pl.LightningDataModule):
           读取视频标注文件，包含训练集文件和测试集文件
         """
         if stage == "fit":
-            train_example, test_example = self._load_raw_data(test=True)
+            train_example, test_example = self._load_raw_data(val=True)
+            # print(train_example[0].label)
             train_feature = self.convert_examples_to_features(train_example,
                                                               self.args.max_length,
                                                               mode="train")
@@ -338,26 +335,35 @@ class MultimodalDataModule(pl.LightningDataModule):
                                                                                   self.args.clip_duration),
                                                    transform=self._make_transforms(mode="train"),
                                                    video_sampler=torch.utils.data.sampler.RandomSampler)
-            self.test_dataset = MultimodalDataset(input_features=test_feature,
-                                                  clip_sampler=make_clip_sampler("random",
-                                                                                 self.args.clip_duration),
-                                                  transform=self._make_transforms(mode="train"),
-                                                  video_sampler=torch.utils.data.sampler.RandomSampler)
+            self.val_dataset = MultimodalDataset(input_features=test_feature,
+                                                 clip_sampler=make_clip_sampler("random",
+                                                                                self.args.clip_duration),
+                                                 transform=self._make_transforms(mode="train"),
+                                                 video_sampler=torch.utils.data.sampler.RandomSampler)
 
-    def train_dataloader(self) -> TRAIN_DATALOADERS:
+    def transfer_batch_to_device(self, batch: Any, device: torch.device, dataloader_idx: int) -> Any:
+        for k, v in batch.items():
+            batch[k] = v.to(device)
+
+        return batch
+
+    def train_dataloader(self):
 
         return torch.utils.data.DataLoader(dataset=self.train_dataset,
                                            batch_size=self.args.batch_size,
-                                           collate_fn=self._collate_fn)
+                                           collate_fn=self._collate_fn,
+                                           num_workers=self.args.num_workers
+                                           )
 
-    def test_dataloader(self) -> EVAL_DATALOADERS:
-        return torch.utils.data.DataLoader(dataset=self.test_dataset,
+    def val_dataloader(self):
+        return torch.utils.data.DataLoader(dataset=self.val_dataset,
                                            batch_size=self.args.batch_size,
-                                           collate_fn=self._collate_fn
+                                           collate_fn=self._collate_fn,
+                                           num_workers=self.args.num_workers
 
                                            )
 
-    def _load_raw_data(self, test=False):
+    def _load_raw_data(self, val=False):
         train_example = []
         with open(self.args.train_data, "r", encoding="utf-8") as g:
             train_data = json.load(g)
@@ -366,10 +372,11 @@ class MultimodalDataModule(pl.LightningDataModule):
                     guid=f"train-{index}",
                     video_name=os.path.join(self.args.video_path_prefix, data["video"]),
                     text=data["text"],
+                    # label 为二维数组
                     label=data["label"]
                 ))
 
-        if test:
+        if val:
             test_example = []
             with open(self.args.test_data, "r", encoding="utf-8") as g:
                 test_data = json.load(g)
@@ -391,17 +398,18 @@ class MultimodalDataModule(pl.LightningDataModule):
             batch_token_ids.append(feature["text_input_ids"])
             batch_input_mask.append(feature["text_input_mask"])
             batch_segment_ids.append(feature["text_segment_ids"])
-            batch_labels.append(feature["label_id"])
+            batch_labels.append(np.array(feature["label_id"]))
 
         batch_token_ids = sequence_padding(batch_token_ids, value=self.tokenizer.pad_token_id)
+        batch_input_mask = sequence_padding(batch_input_mask)
         batch_segment_ids = sequence_padding(batch_segment_ids)
         # 先转化为array再转为tensor
         return {
-            "videos": torch.stack(default_convert(videos), dim=0),
-            "token_input_ids": torch.tensor(batch_token_ids),
-            "token_type_ids": torch.tensor(batch_segment_ids),
-            "token_attention_mask": torch.tensor(np.array(batch_input_mask)),
-            "labels": torch.tensor(np.array(batch_labels), dtype=torch.long)
+            "videos": torch.stack(videos, dim=0),
+            "token_input_ids": convert_array_to_tensor(batch_token_ids),
+            "token_type_ids": convert_array_to_tensor(batch_segment_ids),
+            "token_attention_mask": convert_array_to_tensor(batch_input_mask),
+            "labels": convert_array_to_tensor(np.array(batch_labels))
         }
 
     def _make_transforms(self, mode: str):
@@ -455,7 +463,8 @@ class MultimodalDataModule(pl.LightningDataModule):
                 text_input_mask=input_mask,
                 text_segment_ids=segment_ids,
                 video_name=example.video_name,
-                label_id=self.label_encode.transform(example.label)
+                # label transform添加一个维度
+                label_id=self.label_encode.transform([example.label])
             )
         else:
             feature = InputFeature(
@@ -495,9 +504,9 @@ class VideoClassificationLightningModule(pl.LightningModule):
         self.bert_config = BertConfig.from_pretrained(args.bert_model)
         # 更新bert config
         # TODO
-        self.train_accuracy = torchmetrics.Accuracy()
+        self.acc = torchmetrics.Accuracy(num_classes=2, top_k=1)
         # 加载video模型并初始化
-        self.video_swin = SwinTransformer3D()
+        self.video_swin = SwinTransformer3D(pretrained=args.pretrained_video)
         # 加载文本模型并初始化
         self.bert = BertModel.from_pretrained(args.bert_model,
                                               config=self.bert_config
@@ -518,6 +527,13 @@ class VideoClassificationLightningModule(pl.LightningModule):
         else:
             self.avg_pool = None
         self.linear = nn.Linear(in_features=args.hidden_size, out_features=2)
+        # 加载预训练的权重
+        self.init_weights()
+        self.save_hyperparameters()
+
+    def init_weights(self):
+        logger.info("loading video pretrain model")
+        self.video_swin.init_weights()
 
     @staticmethod
     def add_model_special_args(parent_parser: argparse.ArgumentParser):
@@ -551,7 +567,7 @@ class VideoClassificationLightningModule(pl.LightningModule):
         text_feature = self.bert(text_inputs_ids, text_attention_mask, text_token_type_ids).last_hidden_state
         # text_feature shape= [N,sequence length ,768]
         # concat text token and image token
-        output_feature = torch.concat((text_feature, video_feature), dim=1)
+        output_feature = torch.cat((text_feature, video_feature), dim=1)
         # 构建image序列mask
         # image_attention_mask = torch.ones(video_feature.size(0), video_feature.size(1)).type_as(text_inputs_ids)
         #
@@ -564,19 +580,52 @@ class VideoClassificationLightningModule(pl.LightningModule):
         return cross_output, pooled_output
 
     def training_step(self, batch, batch_idx):
+        labels = batch["labels"].squeeze().to(dtype=torch.long)
         _, y = self.forward(video_inputs=batch["videos"],
                             text_inputs_ids=batch["token_input_ids"],
                             text_attention_mask=batch["token_attention_mask"],
                             text_token_type_ids=batch["token_type_ids"])
         y_hat = self.linear(y)
-        loss = F.cross_entropy(y_hat, batch["labels"].squeeze())
-        self.log("train_loss", loss)
+        loss = F.cross_entropy(y_hat, labels)
+        self.log("train_loss", loss, prog_bar=True)
         return loss
+
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        label = batch["labels"].squeeze().to(dtype=torch.long)
+        _, y = self.forward(video_inputs=batch["videos"],
+                            text_inputs_ids=batch["token_input_ids"],
+                            text_attention_mask=batch["token_attention_mask"],
+                            text_token_type_ids=batch["token_type_ids"])
+        y_hat = self.linear(y)
+        loss = F.cross_entropy(y_hat, label)
+        output = F.softmax(y_hat, dim=-1)
+        self.log("val_loss", loss, prog_bar=True)
+        return output, label
+
+    def validation_epoch_end(self, outputs) -> None:
+        # print(outputs)
+        preds = []
+        targets = []
+        for pred, target in outputs:
+            preds.extend(torch.split(pred, 1, dim=0))
+            targets.extend(torch.split(target, 1, dim=0))
+        p = torch.stack(preds, dim=0)
+        p = torch.reshape(p, shape=[-1, p.shape[-1]])
+        t = torch.stack(targets, dim=0)
+        t = torch.reshape(t, shape=[-1])
+        acc = self.acc(p, t)
+        self.log("val_acc", acc, prog_bar=True, on_epoch=True)
+        return
 
     def configure_optimizers(self):
         # 需要重新定义优化器和学习率
         optimizer = torch.optim.SGD(
-            self.parameters(),
+            [
+                {"params": self.video_swin.parameters(), "lr": self.args.lr * 100},
+                {"params": self.bert.parameters(), "lr": self.args.lr},
+                {"params": self.linear.parameters()},
+                {"params": self.co_transformer.parameters()}
+            ],
             lr=self.args.lr,
             momentum=self.args.momentum,
             weight_decay=self.args.weight_decay,
@@ -604,23 +653,17 @@ def main():
     parser = argparse.ArgumentParser()
     # Model parameters.
     parser.add_argument("--bert_model", type=str, required=True, default=None)
+    parser.add_argument("--pretrained_video", type=str, help="pretrained video model")
     parser.add_argument("--lr", "--learning-rate", default=0.1, type=float)
     parser.add_argument("--momentum", default=0.9, type=float)
     parser.add_argument("--weight_decay", default=1e-4, type=float)
-    parser.add_argument(
-        "--arch",
-        default="swin_transformer",
-        choices=["swin_transformer", "swin_transformer"],
-        type=str,
-    )
-
     # Data parameters.
     parser.add_argument("--train_data", default=None, type=str)
     parser.add_argument("--test_data", default=None, type=str)
 
     parser.add_argument("--max_length", default=128, type=int)
     parser.add_argument("--video_path_prefix", default="F:\\Video\\demo", type=str)
-    parser.add_argument("--workers", default=1, type=int)
+    parser.add_argument("--num_workers", default=4, type=int)
     parser.add_argument("--batch_size", default=2, type=int)
     parser.add_argument("--clip_duration", default=2, type=float)
     parser.add_argument("--video_num_subsampled", default=8, type=int)
@@ -636,23 +679,28 @@ def main():
 
     # 添加模型参数
     parser = VideoClassificationLightningModule.add_model_special_args(parser)
+
     # 设置默认参数
     parser.set_defaults(
-        max_epochs=200,
-        callbacks=[LearningRateMonitor()],
+        max_epochs=10,
         replace_sampler_ddp=False,
         max_position_embeddings=512,
         dropout_ratio=0.5
     )
     args = parser.parse_args()
+    checkpoint_callback = ModelCheckpoint(dirpath=args.default_root_dir,
+                                          monitor='train_loss',
+                                          filename='multimodal_video-{epoch:02d}-{train_loss:.2f}')
+    early_stop = EarlyStopping("val_loss", mode="max", patience=3, min_delta=0.2)
+
     tokenizer = BertTokenizer.from_pretrained(args.bert_model)
     label_encode = LabelEncoder()
     label_encode.fit(['0', '1'])
 
-    trainer = pl.Trainer.from_argparse_args(args)
+    trainer = pl.Trainer.from_argparse_args(args, callbacks=[LearningRateMonitor(), checkpoint_callback, early_stop])
     classification_module = VideoClassificationLightningModule(args)
     data_module = MultimodalDataModule(args=args, tokenizer=tokenizer, label_encode=label_encode)
-    trainer.fit(classification_module, data_module)
+    trainer.fit(classification_module, data_module, )
 
 
 if __name__ == "__main__":

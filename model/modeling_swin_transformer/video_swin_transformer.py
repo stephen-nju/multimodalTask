@@ -16,10 +16,8 @@ from timm.models.layers import DropPath, trunc_normal_
 from functools import reduce, lru_cache
 from operator import mul
 from einops import rearrange
-import logging
 from mmcv.runner import load_checkpoint
-
-logger = logging.getLogger("video_transformer")
+from loguru import logger
 
 
 class Mlp(nn.Module):
