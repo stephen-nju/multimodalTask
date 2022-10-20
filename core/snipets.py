@@ -95,6 +95,6 @@ def convert_array_to_tensor(data):
 
 
 if __name__ == '__main__':
-    a = [np.array([1, 2]), 3]
-    v = convert_to_tensor(a)
+    a = [np.array([1, 2]), np.array([2, 3])]
+    v = convert_array_to_tensor(a)
     print(v)
