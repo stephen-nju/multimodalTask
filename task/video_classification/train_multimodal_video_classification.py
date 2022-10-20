@@ -269,7 +269,7 @@ class VideoClassificationLightningModule(pl.LightningModule):
         self.linear = nn.Linear(in_features=args.hidden_size, out_features=2)
         # 加载预训练的权重
         self.init_weights()
-        self.save_hyperparameters()
+        self.save_hyperparameters(args)
 
     def init_weights(self):
         torch.nn.init.trunc_normal_(self.linear.weight, std=0.02)
@@ -326,7 +326,7 @@ class VideoClassificationLightningModule(pl.LightningModule):
 
     def on_train_start(self) -> None:
         # 训练开始时候 记录模型
-        self.logger.experiment.log_graph(self)
+        self.logger.log_graph(self)
 
     def training_step(self, batch, batch_idx):
         labels = batch["labels"].squeeze().to(dtype=torch.long)
@@ -469,6 +469,7 @@ def main():
 
     # 设置部分默认参数
     parser.set_defaults(
+        optimizer_name="SGD",
         max_epochs=10,
         replace_sampler_ddp=False,
         max_position_embeddings=256,
@@ -483,8 +484,7 @@ def main():
         num_clips=1,
         image_means=(123.675, 116.28, 103.53),
         image_stds=(58.395, 57.12, 57.375),
-        # video_means=(0.45, 0.45, 0.45),
-        # video_stds=(0.225, 0.225, 0.225),
+
     )
     args = parser.parse_args()
     checkpoint_callback = ModelCheckpoint(dirpath=args.default_root_dir,

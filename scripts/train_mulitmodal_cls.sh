@@ -22,4 +22,6 @@ CUDA_VISIABLE_DEVICES=0,1 python task/video_classification/train_multimodal_vide
   --lr=1e-3 \
   --max_length=128 \
   --batch_size=2 \
-  --accumulate_grad_batches=2
+  --accumulate_grad_batches=2 \
+  --optimizer_name=SGD \
+  --momentum=0.9 \
