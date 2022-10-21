@@ -12,14 +12,16 @@ import copy
 import functools
 from abc import ABCMeta
 from typing import Optional, Tuple, List, Type, Callable, Any
-
 import torch
 from pytorchvideo.data import ClipSampler
 from pytorchvideo.data.utils import MultiProcessSampler
 from pytorchvideo.data.video import VideoPathHandler
 from torch.utils.data import IterableDataset
 from loguru import logger
-from torch.utils.data.dataset import T_co
+from data_loading import SampleFrames
+import decord
+import io
+import numpy as np
 
 
 class InputExample(object):
@@ -89,6 +91,7 @@ class MultimodalDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self._input_features)
+
 
 #
 # class MultimodalDataset(IterableDataset, metaclass=ABCMeta):
@@ -307,3 +310,32 @@ class MultimodalDataset(torch.utils.data.Dataset):
 #             self._video_random_generator.manual_seed(base_seed)
 #
 #         return self
+
+from torchvision.datasets.video_utils import VideoClips
+class VideoLanguageDataset(torch.utils.data.Dataset):
+    def __init__(self, args, input_features: List[InputFeature], video_sample, video_transform):
+        self._args = args
+        self._input_features = input_features,
+        self._video_transform = video_transform,
+        self._video_sample = video_sample
+
+    def _video_process(self, video_path: str):
+        # 包含视频的读取，抽帧
+        total_frame = 0
+        try:
+            video_reader = decord.VideoReader(video_path, num_threads=self._args.num_thread)
+        except Exception as e:
+            raise RuntimeError(f"Failed to open video {video_path} with Decord. {e}")
+        total_frame = len(video_reader)
+        video = self._video_sample(video_reader)
+        return video
+
+    def __getitem__(self, index):
+        feature = self._input_features[index]
+        feature_dict = copy.deepcopy(feature.__dict__)
+        video_name = feature.video_name
+        video = self._video_process(video_name)
+        video = self._video_transform(video)
+        feature_dict["video"] = video
+
+        return feature_dict

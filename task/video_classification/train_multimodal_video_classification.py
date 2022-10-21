@@ -477,7 +477,8 @@ def main():
         patch_size=(4, 4, 4),
         drop_path_rate=0.2,
         dropout_ratio=0.3,
-        learning_rate_bert=1e-5,
+        # ===========train param================
+        learning_rate_bert=1e-4,
         learning_rate_video=1e-3,
         # =======video data process=============
         clip_len=32,
