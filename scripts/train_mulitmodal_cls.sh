@@ -8,8 +8,8 @@ export DEFAULT_ROOT_DIR=/home/nlpbigdata/local_disk/experiment
 source activate base
 CUDA_VISIABLE_DEVICES=0,1 python task/video_classification/train_multimodal_video_classification.py \
   --default_root_dir="${DEFAULT_ROOT_DIR}" \
-  --gpus=2 \
-  --max_epochs=40 \
+  --gpus=1 \
+  --max_epochs=4 \
   --accelerator=gpu \
   --strategy=ddp \
   --num_workers=4 \

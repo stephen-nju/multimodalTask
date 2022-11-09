@@ -12,32 +12,6 @@ import numpy as np
 
 
 class VideoSample:
-    """Sample frames from the video.
-    Required keys are "total_frames", "start_index" , added or modified keys
-    are "frame_inds", "frame_interval" and "num_clips".
-
-    Args:
-        clip_len (int): Frames of each sampled output clip.
-        frame_interval (int): Temporal interval of adjacent sampled frames.
-            Default: 1.
-        num_clips (int): Number of clips to be sampled. Default: 1.
-        temporal_jitter (bool): Whether to apply temporal jittering.
-            Default: False.
-        twice_sample (bool): Whether to use twice sample when testing.
-            If set to True, it will sample frames with and without fixed shift,
-            which is commonly used for testing in TSM model. Default: False.
-        out_of_bound_opt (str): The way to deal with out of bounds frame
-            indexes. Available options are 'loop', 'repeat_last'.
-            Default: 'loop'.
-        test_mode (bool): Store True when building test or validation dataset.
-            Default: False.
-        start_index (None): This argument is deprecated and moved to dataset
-            class (``BaseDataset``, ``VideoDataset``, ``RawframeDataset``,
-            etc), see this: https://github.com/open-mmlab/mmaction2/pull/89.
-        keep_tail_frames (bool): Whether to keep tail frames when sampling.
-            Default: False.
-    """
-
     def __init__(self,
                  clip_len,
                  frame_interval=1,

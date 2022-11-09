@@ -311,15 +311,13 @@ class MultimodalDataset(torch.utils.data.Dataset):
 #
 #         return self
 
-from torchvision.datasets.video_utils import VideoClips
 class VideoLanguageDataset(torch.utils.data.Dataset):
-    def __init__(self, args, input_features: List[InputFeature], video_sample, video_transform):
+    def __init__(self, args, input_features: List[InputFeature], video_sample):
         self._args = args
         self._input_features = input_features,
-        self._video_transform = video_transform,
         self._video_sample = video_sample
 
-    def _video_process(self, video_path: str):
+    def _video_process(self, video_path: str, mode: str):
         # 包含视频的读取，抽帧
         total_frame = 0
         try:
@@ -335,7 +333,6 @@ class VideoLanguageDataset(torch.utils.data.Dataset):
         feature_dict = copy.deepcopy(feature.__dict__)
         video_name = feature.video_name
         video = self._video_process(video_name)
-        video = self._video_transform(video)
         feature_dict["video"] = video
 
         return feature_dict

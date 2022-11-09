@@ -410,8 +410,6 @@ class VideoClassificationLightningModule(pl.LightningModule):
                 momentum=self.args.momentum,
                 weight_decay=self.args.weight_decay,
             )
-
-
         else:
             assert False, f'Unknown optimizer: "{self.hparams.optimizer_name}"'
 

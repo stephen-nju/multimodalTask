@@ -1,3 +1,13 @@
+# -*- coding: utf-8 -*-
+"""
+@author: zhubin
+@email:zhubinnju@outlook.com
+@license: Apache Licence
+@software:PyCharm
+@file: extract_video_feature_using_c3d.py
+@time: 2022/11/3 15:40
+"""
+
 import torch
 import numpy as np
 from mmaction.apis import init_recognizer, inference_recognizer
@@ -19,4 +29,3 @@ results, returned_features = inference_recognizer(model, video, outputs="backbon
 
 print(results)
 # feat = returned_features.numpy()
-
