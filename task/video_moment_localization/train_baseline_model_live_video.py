@@ -15,17 +15,18 @@ from dataclasses import dataclass
 from functools import partial
 from multiprocessing import cpu_count, Pool
 from typing import Optional, Any, List
-from loguru import logger
+
 import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
+from loguru import logger
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
-from torch.nn import CrossEntropyLoss
-from torch.utils.data.dataset import Dataset
 from torch.utils.data.dataloader import DataLoader
+from torch.utils.data.dataset import Dataset
 from tqdm import tqdm
-from transformers import BertConfig, BertForSequenceClassification, BertTokenizer, BertModel
+from transformers import BertConfig, BertTokenizer, BertModel
+
 from core.snipets import sequence_padding, convert_array_to_tensor
 from model.modeling_vml.video_moment_loc_base_model import SimpleVideoMomentLoc
 
@@ -163,7 +164,6 @@ class FeatureDataModule(pl.LightningDataModule):
     def setup(self, stage: Optional[str] = None) -> None:
         if stage == "fit":
             logger.info("loading train and val dataset")
-
             train_example = self.load_examples(self.args.train_data)
             train_feature = self.convert_examples_to_features(train_example, max_length=self.args.max_length)
             self.train_dataset = FeatureDataset(train_feature)
@@ -252,6 +252,10 @@ class VideoMomentLocBaseModel(pl.LightningModule):
         return start_logits, end_logits
 
     def configure_optimizers(self):
+        # 冻结bert
+        for n, p in self.bert.named_parameters():
+            p.requires_grad = False
+
         # 需要重新定义优化器和学习率
         no_decay = ['bias', 'layer_norm', 'LayerNorm']
         if self.hparams.optimizer_name == "Adam":
@@ -293,7 +297,6 @@ class VideoMomentLocBaseModel(pl.LightningModule):
             end_loss = (end_loss * label_mask.view(-1)).sum() / label_mask.sum()
         else:
             raise ValueError("This type of loss func do not exists.")
-
         total_loss = (start_loss + end_loss) / 2
 
         return total_loss, start_loss, end_loss
@@ -310,8 +313,6 @@ class VideoMomentLocBaseModel(pl.LightningModule):
         end_labels = batch["end_position"]
         query_token_ids = batch["query_token_ids"]
         label_mask = batch["labels_mask"]
-        logger.info(f"video={video_feature.shape}")
-        logger.info(f"text_{text_feature.shape}")
         video_feature = torch.squeeze(video_feature, dim=1)
         text_feature = torch.squeeze(text_feature, dim=1)
         pooled_output = self.bert(query_token_ids).pooler_output
@@ -335,9 +336,15 @@ class VideoMomentLocBaseModel(pl.LightningModule):
         end_labels = batch["end_position"]
         query_token_ids = batch["query_token_ids"]
         label_mask = batch["labels_mask"]
-        cls_feature = self.bert(query_token_ids).last_hidden_state
-        cls_feature = cls_feature[:, 0, :]
-        print(cls_feature)
+        video_feature = torch.squeeze(video_feature, dim=1)
+        text_feature = torch.squeeze(text_feature, dim=1)
+        pooled_output = self.bert(query_token_ids).pooler_output
+        start_logits, end_logits = self.forward(video_feature=video_feature,
+                                                text_feature=text_feature,
+                                                query_feature=pooled_output)
+        total_loss, start_loss, end_loss = self.compute_loss(start_logits, end_logits, start_labels, end_labels,
+                                                             label_mask)
+        self.log("val_loss", total_loss, prog_bar=True)
 
 
 def setup_seed(seed):
@@ -384,9 +391,9 @@ def main():
     # ====================定制call backs=========================================
     call_backs = []
     checkpoint_callback = ModelCheckpoint(dirpath=args.default_root_dir,
-                                          monitor='total_loss',
+                                          monitor='train_total_loss',
                                           filename='multimodal_video-{epoch:02d}-{train_loss:.2f}')
-    early_stop = EarlyStopping("loss", mode="min", patience=5, min_delta=0.01, verbose=True)
+    early_stop = EarlyStopping("val_loss", mode="min", patience=5, min_delta=0.01, verbose=True)
 
     call_backs.append(checkpoint_callback)
     call_backs.append(early_stop)

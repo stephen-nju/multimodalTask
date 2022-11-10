@@ -22,4 +22,4 @@ python task/video_moment_localization/train_baseline_model_live_video.py \
   --batch_size=2 \
   --accumulate_grad_batches=2 \
   --optimizer_name=Adam \
-  --loss_type=ce
+  --loss_type=bce
