@@ -2,7 +2,6 @@ import torch
 
 
 def segment_tiou(box_a, box_b):
-
     """ We resize both tensors to [A,B,2] without new malloc:
     [A,2] -> [A,1,2] -> [A,B,2]
     [B,2] -> [1,B,2] -> [A,B,2]

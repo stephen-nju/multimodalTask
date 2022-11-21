@@ -74,12 +74,6 @@ class MultimodalDataModule(pl.LightningDataModule):
                                                  pipeline=self._make_val_pipeline(),
                                                  )
 
-    def transfer_batch_to_device(self, batch: Any, device: torch.device, dataloader_idx: int) -> Any:
-        for k, v in batch.items():
-            batch[k] = v.to(device)
-
-        return batch
-
     def train_dataloader(self):
 
         return torch.utils.data.DataLoader(dataset=self.train_dataset,
@@ -347,7 +341,7 @@ class VideoClassificationLightningModule(pl.LightningModule):
         tensorboard = self.logger.experiment
         # 查看线性映射层的gradient
         for name, param in self.linear.named_parameters():
-            tensorboard.add_histogram(name + "_grad", param.grad)
+            tensorboard.add_histogram(name + "_grad", param.grad, self.global_step)
 
     def validation_step(self, batch, batch_idx):
         labels = batch["labels"].squeeze().to(dtype=torch.long)
